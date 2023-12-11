@@ -1,0 +1,183 @@
+---
+- name: Windows Updates Install and Prepare for Reboot
+  hosts: green
+  gather_facts: no
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Reboot server 
+      win_reboot:
+      async: 7200 # 2 time
+      poll: 0     
+      register: reboot_result
+
+    - name: Report update completion
+      debug:
+        msg: "Alle har blitt rebootet."
+      when: reboot_result.rebooted
+
+    # Sjekker ledig plass på C:-disken
+    - name: 'Check free space in C:'
+      win_shell: |
+        $freeSpace = (Get-PSDrive C).Free
+        Write-Host $freeSpace
+      register: freespace
+
+    # Setter en flaggvariabel hvis plassen er under 30 GB
+    - name: Set flag for low disk space
+      set_fact:
+        low_disk_space: true
+      when: freespace.stdout | int < 30 * 1024 * 1024 * 1024
+
+    # Rapporterer ledig diskplass
+    - name: report free disk space
+      debug:
+        msg: "{{ (freespace.stdout | int) / 1024 / 1024 / 1024 }} GB"
+
+    # Sørger for at et spesifikt katalog for loggfiler eksisterer
+    - name: Ensure Ansible_windows_updates directory exists
+      win_file:
+        path: "{{ update_log_dir }}"
+        state: directory
+
+    # Henter gjeldende dato for loggfilnavngiving
+    - name: Get current date
+      set_fact:
+        current_date: "{{ lookup('pipe', 'date +%Y-%m-%d') }}"
+
+    - name: Check for available updates
+      win_updates:
+        state: searched
+      register: available_updates
+
+    - name: Report servers that need updates
+      debug:
+        msg: "{{ available_updates.updates | length }} updates are available for installation."
+      when: (available_updates.updates | length) > 0
+
+    - name: Install updates without reboot
+      win_updates:
+        reboot: no
+        log_path: "{{ update_log_dir }}\\patch_{{ current_date }}.log"
+      async: 3600  # 1 time
+      poll: 900    # Sjekk status hver 15. minutt
+      when: (available_updates.updates | length) > 0
+      register: update_result
+
+    - name: Set updates found flag
+      set_fact:
+        updates_found: "{{ (available_updates.updates | length) > 0 }}"
+      run_once: true
+      delegate_to: localhost
+
+    # Feilhåndtering for oppdateringsprosessen
+    - name: Handle update errors
+      debug:
+        msg: "Feil under oppdatering: {{ update_result.failed_updates }}"
+      when: update_result.failed_updates is defined and update_result.failed_updates | length > 0
+      register: update_errors
+
+    # Samler informasjon om installerte oppdateringer
+    - name: Gather installed updates
+      win_shell: >
+        Get-WmiObject -Class "Win32_QuickFixEngineering" | 
+        Select-Object -Property "Description", "InstalledOn" | 
+        Sort-Object -Property InstalledOn -Descending | 
+        Format-Table -AutoSize | 
+        Out-String -Width 4096
+      register: win_updates
+
+        
+    # Setter fakta for e-postkropp
+    - name: Set facts for email
+      set_fact:
+        update_info: "{{ update_result.updates | default([]) }}"
+        reboot_info: "{{ reboot_result | default('') }}"  
+      run_once: true
+
+- hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars.yml
+
+  tasks:
+    # Konstruerer e-postkroppen med statusinformasjon
+    - name: Construct email body
+      set_fact:
+        email_body: |
+          Report disk space
+          {% for host in groups['green'] %}
+          {{ host }}:{% if hostvars[host].freespace is defined %} Disk space: {{ (hostvars[host].freespace.stdout | int) / 1024 / 1024 / 1024 }} GB free
+          {% if hostvars[host].low_disk_space is defined and hostvars[host].low_disk_space %}- Warning: Low disk space
+          {% endif %}
+          {% else %} Disk space info not available
+          {% endif %}
+          {% endfor %}
+          
+          Windows reboot status
+          {% for host in groups['green'] %}
+          {{ host }}:{% if hostvars[host].reboot_result is defined %}
+          {% if hostvars[host].reboot_result.unreachable %}Reboot is UNREACHABLE
+          {% elif hostvars[host].reboot_result.changed and hostvars[host].reboot_result.rebooted %}Reboot OK
+          {% else %}Reboot FAILED or UNNECESSARY
+          {% endif %}
+          {% else %}No reboot info available
+          {% endif %}
+          {% endfor %}
+
+          Display update result
+          {% for host in groups['green'] %}
+          {% if hostvars[host].update_result is defined %}
+          {{ host }}: {{ 'Server is UpToDate' if not hostvars[host].update_result.changed or not hostvars[host].update_result.reboot_required else 'All updates installed and server is ready for reboot' }}
+          {% else %}
+          {{ host }}: Update info not available
+          {% endif %}
+          {% endfor %}
+
+          Update Errors:
+          {% for host in groups['green'] %}
+          {% if hostvars[host].update_errors is defined %}
+          {{ host }}:
+          {% if hostvars[host].update_errors.failed_updates is defined and hostvars[host].update_errors.failed_updates | length > 0 %}
+          Error during update: {{ hostvars[host].update_errors.failed_updates }}
+          {% else %}
+          No update errors.
+          {% endif %}
+          {% else %}
+          {{ host }}: Update errors info not available
+          {% endif %}
+          {% endfor %}
+          
+          Display KB result
+          {% for host in groups['green'] %}
+          {% if hostvars[host].update_info is defined and hostvars[host].update_info is mapping %}
+          {{ host }}:
+          {% if hostvars[host].update_info | length > 0 %}
+          {% for update_id, update in hostvars[host].update_info.items() %}
+          {% if update.installed %}
+          KB{{ update.kb | join(', KB') }},
+          {% endif %}
+          {% endfor %}
+          {% else %}
+          {{ host }}: No KB updates installed
+          {% endif %}
+          {% else %}
+          {{ host }}: No new KB updates installed or host unreachable
+          {% endif %} 
+          {% endfor %}
+      run_once: true
+
+    # Sender e-postoppsummering
+    - name: Send email summary
+      community.general.mail:
+        host: "{{ email_host }}"
+        port: "{{ email_port }}"
+        username: "{{ email_username }}"
+        password: "{{ email_password }}"
+        secure: "{{ email_secure }}"
+        from: "{{ email_from }}"
+        to: "{{ email_recipients }}"
+        subject: 'Windows Update Status for Green Group'
+        body: "{{ email_body }}"
+      run_once: true
