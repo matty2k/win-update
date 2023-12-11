@@ -121,10 +121,8 @@
 
           Update Errors:
           {% for host in groups['green'] %}
-          # Checks if update_errors is defined for each host
           {% if hostvars[host].update_errors is defined %}
           {{ host }}:
-          # Checks if there are any failed updates and displays them
           {% if hostvars[host].update_errors.failed_updates is defined and hostvars[host].update_errors.failed_updates | length > 0 %}
           Error during update: {{ hostvars[host].update_errors.failed_updates }}
           {% else %}
