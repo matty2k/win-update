@@ -1,0 +1,10 @@
+email_recipients:
+  - example@example.com
+host: 
+port: 
+username: 
+password: 
+secure: 
+from: 
+to: 
+body: 

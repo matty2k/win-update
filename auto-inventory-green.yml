@@ -1,0 +1,73 @@
+---
+- name: Hent driftdag tilgang fra Active Directory
+  hosts: dc01
+  gather_facts: no
+
+  tasks:
+    - name: Hent green_driftdag fra Active Directory
+      win_command: powershell.exe -Command "Get-ADComputer -Filter {memberOf -RecursiveMatch 'CN=green,OU=example,OU=example,DC=example,DC=local'} | Select-Object -ExpandProperty DNSHostName"
+      register: green_driftdag
+
+    - name: Formater green_driftdag
+      set_fact:
+        formatted_green_driftdag: "{{ green_driftdag.stdout_lines | list }}"
+
+    - name: Dele variabelen til localhost
+      set_fact:
+        global_green: "{{ formatted_green_driftdag }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: Display green_driftdag
+      debug:
+        var: formatted_green_driftdag
+
+- name: Oppdater hosts basert på AD gruppen green
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Fjern eksisterende vertsnavn fra [green] seksjonen
+      lineinfile:
+        path: /home/ansible/windows/green/hosts
+        state: absent
+        regexp: '^.*\.example\.local$'
+
+    - name: Legg til vertsnavn under [green] seksjonen
+      lineinfile:
+        path: /home/ansible/windows/green/hosts
+        insertafter: '^\[green\]$'
+        line: "{{ item }}"
+      loop: "{{ global_green }}"
+
+    - name: Vis innholdet av /home/ansible/windows/green/hosts
+      ansible.builtin.command: cat /home/ansible/windows/green/hosts
+      register: hosts_content
+      changed_when: false
+
+    - name: Skriv ut innholdet av /home/ansible/windows/green/hosts
+      debug:
+        var: hosts_content.stdout_lines
+
+    - name: Construct email body
+      set_fact:
+        email_body: |
+          Tilgang sjekk
+          Innhold av Green hosts
+          {% for line in global_green %}
+          {{ line }}
+          {% endfor %}
+
+    # Sender e-postoppsummering
+    - name: Send email summary
+      community.general.mail:
+        host: "{{ email_host }}"
+        port: "{{ email_port }}"
+        username: "{{ email_username }}"
+        password: "{{ email_password }}"
+        secure: "{{ email_secure }}"
+        from: "{{ email_from }}"
+        to: "{{ email_recipients }}"
+        subject: 'Windows Update Status for Green Group'
+        body: "{{ email_body }}"
+      run_once: true
